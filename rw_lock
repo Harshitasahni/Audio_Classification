@@ -1,0 +1,151 @@
+"""
+rwlock_benchmark.py
+
+Standalone benchmark of readerwriterlock.RWLockFair to measure:
+  1. The irreducible cost of acquiring an uncontested lock (the floor).
+  2. How wait time grows with concurrent readers/writers.
+
+No data, no GSM logic, no MD. Just the lock primitive.
+"""
+import time
+import threading
+import argparse
+import statistics
+from readerwriterlock import rwlock
+
+
+def benchmark_lock(n_threads: int, n_ops_per_thread: int,
+                   write_ratio: float = 0.1, work_us: float = 0.0):
+    """
+    Spawn n_threads workers, each doing n_ops_per_thread lock acquisitions.
+    Each acquisition is either a write (prob = write_ratio) or read.
+    Optionally, hold the lock for `work_us` microseconds to simulate work.
+    
+    Returns: list of (thread_id, op_type, wait_seconds, hold_seconds) tuples.
+    """
+    lock = rwlock.RWLockFair()
+    results = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(n_threads)  # synchronize start
+
+    def worker(thread_id: int):
+        # Each thread does its own RNG-driven mix
+        import random
+        rng = random.Random(thread_id)
+        local_results = []
+
+        # Wait for all threads ready
+        barrier.wait()
+
+        for op_idx in range(n_ops_per_thread):
+            is_write = rng.random() < write_ratio
+            
+            t_request = time.perf_counter()
+            if is_write:
+                with lock.gen_wlock():
+                    t_acquired = time.perf_counter()
+                    if work_us > 0:
+                        # Simulate brief work under the lock
+                        target = t_acquired + work_us / 1e6
+                        while time.perf_counter() < target:
+                            pass
+                    t_released = time.perf_counter()
+            else:
+                with lock.gen_rlock():
+                    t_acquired = time.perf_counter()
+                    if work_us > 0:
+                        target = t_acquired + work_us / 1e6
+                        while time.perf_counter() < target:
+                            pass
+                    t_released = time.perf_counter()
+            
+            wait = t_acquired - t_request
+            hold = t_released - t_acquired
+            local_results.append((thread_id,
+                                  "write" if is_write else "read",
+                                  wait, hold))
+        
+        # Append all results at the end to avoid contention on results_lock
+        with results_lock:
+            results.extend(local_results)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    
+    t_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    t_end = time.perf_counter()
+    
+    return results, (t_end - t_start)
+
+
+def report(results, total_time, n_threads, n_ops_per_thread, write_ratio, work_us):
+    print(f"\n=== Results: {n_threads} threads × {n_ops_per_thread} ops "
+          f"(write_ratio={write_ratio:.2f}, work={work_us} µs) ===")
+    print(f"Total wall-clock: {total_time:.3f} s")
+    print(f"Total ops: {len(results)}")
+    print(f"Aggregate throughput: {len(results) / total_time:.0f} ops/sec\n")
+
+    waits = [r[2] for r in results]
+    holds = [r[3] for r in results]
+    read_waits = [r[2] for r in results if r[1] == "read"]
+    write_waits = [r[2] for r in results if r[1] == "write"]
+    
+    def fmt_stats(label, values):
+        if not values:
+            print(f"{label}: no data")
+            return
+        median = statistics.median(values) * 1e6
+        mean = statistics.mean(values) * 1e6
+        p99 = sorted(values)[int(len(values) * 0.99)] * 1e6
+        mx = max(values) * 1e6
+        print(f"{label}: median={median:8.2f} µs  mean={mean:8.2f} µs  "
+              f"p99={p99:8.2f} µs  max={mx:8.2f} µs  (n={len(values)})")
+    
+    fmt_stats("All waits", waits)
+    fmt_stats("Read waits", read_waits)
+    fmt_stats("Write waits", write_waits)
+    fmt_stats("Holds", holds)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--threads", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32],
+                        help="Thread counts to test (space-separated)")
+    parser.add_argument("--ops", type=int, default=1000,
+                        help="Operations per thread")
+    parser.add_argument("--write_ratio", type=float, default=0.1,
+                        help="Fraction of ops that are writes (0.0 to 1.0)")
+    parser.add_argument("--work_us", type=float, default=0.0,
+                        help="Microseconds to hold the lock (simulates work). "
+                             "0 = pure lock overhead.")
+    args = parser.parse_args()
+    
+    print(f"Configuration: write_ratio={args.write_ratio}, work_us={args.work_us}, "
+          f"ops_per_thread={args.ops}")
+    
+    summary = []
+    for n in args.threads:
+        results, total_time = benchmark_lock(
+            n_threads=n,
+            n_ops_per_thread=args.ops,
+            write_ratio=args.write_ratio,
+            work_us=args.work_us,
+        )
+        report(results, total_time, n, args.ops, args.write_ratio, args.work_us)
+        
+        waits = [r[2] for r in results]
+        median_wait = statistics.median(waits) * 1e6
+        p99_wait = sorted(waits)[int(len(waits) * 0.99)] * 1e6
+        summary.append((n, median_wait, p99_wait, len(results) / total_time))
+    
+    print(f"\n\n=== Summary ===")
+    print(f"{'Threads':<10}{'Median (µs)':<15}{'p99 (µs)':<15}{'Throughput (ops/s)':<20}")
+    for n, med, p99, tput in summary:
+        print(f"{n:<10}{med:<15.2f}{p99:<15.2f}{tput:<20.0f}")
+
+
+if __name__ == "__main__":
+    main()
